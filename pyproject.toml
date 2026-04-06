@@ -30,3 +30,14 @@ testpaths = ["bot/tests"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.hatch.build.targets.wheel]
+packages = ["bot"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/bot",
+  "/README.md",
+  "/pyproject.toml",
+  "/.env.example",
+]
