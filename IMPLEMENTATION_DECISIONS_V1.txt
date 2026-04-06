@@ -1,0 +1,249 @@
+IMPLEMENTATION DECISIONS V1
+
+This file supplements TZ_rewritten.txt and is mandatory for implementation.
+If there is a conflict between draft notes, intermediate discussions, or generated code,
+TZ_rewritten.txt and this file take priority.
+
+1. PURPOSE
+The goal of this file is to lock the main architectural and behavioral decisions for v1
+before coding begins, so the implementation does not invent or reinterpret critical logic.
+
+2. TERMINOLOGY
+Only these mode names are allowed in code, config, logs, Telegram, and storage:
+- backtest
+- dry_run
+- live
+
+The following words must not be used as separate runtime modes:
+- paper
+- simulation
+- trading
+- real
+
+They may appear only in comments or migration notes.
+
+3. SINGLE-BAR EVENT PRIORITY
+When multiple conditions occur on the same bar, process them in this strict order:
+1) safe_stop / critical safety checks
+2) Full TP
+3) trailing exit
+4) sub-cover
+5) DCA
+6) logging and state persistence
+
+Mandatory conflict rules for v1:
+- If Full TP and DCA trigger on the same bar, execute only Full TP.
+- If Full TP and sub-cover trigger on the same bar, execute only Full TP.
+- If TP touch occurs but close-confirmation is required and not yet confirmed,
+  Full TP must not be executed.
+- If BLOCK_DCA_ON_TP_TOUCH=true, DCA is blocked after TP touch until TP is either confirmed
+  or invalidated by subsequent logic.
+- If sub-cover and DCA both appear possible on the same bar, execute sub-cover first and do not
+  open a new DCA order on that same bar in v1.
+- If there is any ambiguous or conflicting intra-bar state that cannot be resolved deterministically,
+  do not create a new order on that bar; log the event for audit.
+
+4. TOUCH BEHAVIOR
+TOUCH_MODE must be used explicitly and consistently:
+- wick  = high/low touch
+- body  = open/close body touch
+- close = close-only confirmation
+
+No hidden or implicit touch behavior is allowed.
+
+5. EVEN-BAR FILTER
+Default value:
+- EVEN_BAR_ANCHOR_MODE=utc_day_start
+
+This must be the default in config and the default behavior in code.
+It must behave identically in:
+- backtest
+- dry_run
+- live
+- after restart
+
+No alternative anchor mode may silently replace utc_day_start.
+
+6. LOCAL STORAGE IS MANDATORY
+LIFO lots must not be reconstructed from exchange position only.
+The bot must use local persistent storage as the primary internal state model.
+
+Required storage backend for v1:
+- SQLite (mandatory)
+
+JSON may be used only for:
+- debugging snapshots
+- export/import tools
+- temporary diagnostics
+
+The exchange alone is not a sufficient source to rebuild lot order.
+
+7. REQUIRED STORED ENTITIES
+The system must persist at least:
+- cycle_id
+- local bot mode
+- current position size
+- average entry price
+- proceeds
+- num_sells
+- last_fill_price
+- next_level_price
+- trailing state
+- reset_cycle flag
+- all open lots in opening order
+- lot history
+- order_id
+- client_order_id
+- fill_id if available
+- order status
+- partial fill progress
+- timestamps for events and fills
+- orders rolling window counters
+- per-bar counters
+- desync flags
+
+8. ORDER STATE MACHINE IS REQUIRED
+Order handling in live must use an explicit order lifecycle.
+Recommended states:
+- NEW
+- SENT
+- ACKED
+- PARTIALLY_FILLED
+- FILLED
+- CANCELED
+- REJECTED
+- UNKNOWN
+
+Mandatory rules:
+- UNKNOWN status must never trigger blind re-ordering.
+- PARTIALLY_FILLED must update local position only by actually filled quantity.
+- Re-sending the same order without a status check is forbidden.
+- UNKNOWN must be reconciled via explicit order-status check and fill reconciliation.
+- If state remains uncertain after retries, switch to safe_stop.
+
+9. PARTIAL FILL AND UNKNOWN STATUS POLICY
+For v1:
+- partial fill is treated as a normal but high-risk state
+- all partial fills must be written to storage immediately
+- the bot must reconcile fills before any repeat action
+- if exchange response is inconsistent or missing, the bot must query order status
+- if status still cannot be trusted, the bot must go to safe_stop
+
+10. DESYNC POLICY
+Default value:
+- DESYNC_POLICY=safe_stop
+
+Meaning:
+- stop opening new orders
+- write CRITICAL log entry
+- send Telegram alert
+- wait for manual intervention or explicit /sync action
+
+For v1, automatic rebuild_from_exchange is not the default behavior.
+
+11. INVALID ORDER POLICY
+Default value:
+- INVALID_ORDER_POLICY=adjust
+
+Meaning of adjust in v1:
+- normalize price to exchange rules
+- normalize quantity without increasing intended risk
+- quantity may be rounded down to valid step size
+- quantity must not be automatically rounded up in a way that increases exposure
+- if normalized order still violates min_qty or min_notional, skip the order
+
+Therefore, in v1:
+- adjust = safe normalization without risk increase
+- skip   = ignore order and log reason
+- safe_stop = stop bot because order normalization problem is treated as critical
+
+Automatic exposure increase is forbidden in v1.
+
+12. ROUNDING PRINCIPLE
+All order normalization must go through one shared normalization layer.
+The same normalization logic must be used in:
+- dry_run
+- live
+
+No separate ad-hoc rounding per module is allowed.
+
+13. TELEGRAM COMMAND DATA SOURCE
+Telegram commands must read from:
+1) runtime local state
+2) persistent local storage
+
+They must not query the exchange on every request.
+
+Rules for v1:
+- /status uses runtime state + storage
+- /position uses runtime state + storage
+- /pnl uses runtime state + storage
+- /sync is the only command allowed to initiate reconciliation with the exchange
+
+Telegram is a read interface over local state, not an execution source.
+
+14. BINGX TESTNET / DEMO POLICY
+Support for BingX testnet or demo futures endpoints must be verified separately.
+This is a technical spike and not a guaranteed implementation assumption.
+
+Therefore for v1:
+- main verification path = dry_run
+- live is allowed only after dry_run stabilization
+- testnet/demo support is optional unless confirmed by implementation testing
+
+Required spike checklist:
+- authentication
+- instrument metadata
+- place order
+- cancel order
+- order status
+- fills
+- open position sync
+
+If critical futures endpoints are missing or behave differently, do not block the project.
+Continue with dry_run-first development.
+
+15. SAFE-STOP POLICY
+safe_stop is not an optional cosmetic feature.
+It is a core risk-control mechanism.
+
+safe_stop must be triggered on at least:
+- unresolved exchange/local desync
+- unknown order state after retry + reconciliation attempt
+- critical storage inconsistency
+- impossible state transition
+- duplicate execution risk
+- any logic branch where the bot cannot prove current exposure safely
+
+16. TEST PRIORITIES FOR V1
+The following cases are mandatory before live usage:
+- Full TP and DCA on same bar
+- Full TP and sub-cover on same bar
+- TP touch without close confirmation
+- sub-cover and DCA on same bar
+- partial fill handling
+- unknown order state handling
+- restart with existing local lots
+- restart with exchange/local mismatch
+- even-bar behavior after restart
+- invalid order below min_notional
+- Telegram command behavior without exchange access
+- safe_stop activation and recovery flow
+
+17. IMPLEMENTATION DISCIPLINE
+Codex or any developer must not:
+- silently rename mode terminology
+- invent new default behaviors
+- rebuild lot structure only from exchange aggregate position
+- auto-increase order size during adjustment
+- bypass the shared normalization layer
+- bypass local storage for Telegram command answers
+- retry unknown orders blindly
+
+18. PRIORITY OF DOCUMENTS
+Priority order for implementation:
+1) TZ_rewritten.txt
+2) IMPLEMENTATION_DECISIONS_V1.txt
+3) helper notes / drafts / comments
+
+If a generated implementation conflicts with items 1 or 2, the implementation must be changed.

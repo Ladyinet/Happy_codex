@@ -1,0 +1,1062 @@
+# Технічне завдання
+## Python-бот для алгоритмічної торгівлі на BingX
+### На основі логіки TradingView-стратегії “C - limit 14 SHORT (EVEN) bingX COMP”
+
+---
+
+## 1. Мета проєкту
+
+Потрібно створити Python-бота, який максимально точно відтворює логіку поточного Pine Script для short-стратегії з DCA, повним TP, trailing TP, sub-cover, обмеженням частоти ордерів, live-sync стартом, журналюванням подій та Telegram-сповіщеннями.
+
+Бот має працювати з **BingX Perpetual Futures** через API та підтримувати окремі режими:
+- **backtest / simulation** — перевірка логіки на історичних або модельованих даних;
+- **dry_run** — робота на реальному ринку без реального виставлення ордерів;
+- **live** — реальна торгівля через BingX API.
+
+Головна мета — забезпечити безпечний шлях від перевірки логіки до реального запуску на коштах без втрати ключових правил Pine-стратегії.
+
+---
+
+## 2. Загальна концепція стратегії
+
+Бот реалізує алгоритмічну **short-стратегію з усередненням вгору (DCA)**, яка:
+- відкриває початковий short;
+- додає DCA-ордери при русі ціни проти позиції;
+- виконує часткове закриття останнього лота (**sub-cover**) за логікою LIFO;
+- виконує повне закриття всієї позиції (**Full TP**);
+- підтримує **trailing TP** після дотику TP;
+- обмежує частоту ордерів за бар і за rolling-window;
+- веде повний локальний стан, журнал подій і Telegram-сповіщення.
+
+---
+
+## 3. Біржа та джерела даних
+
+### 3.1 Біржа
+- **BingX Perpetual Futures**
+
+### 3.2 Необхідні API
+- **REST API**
+- **WebSocket API**
+
+### 3.3 Основні функції інтеграції
+- отримання OHLCV;
+- отримання last price / mark price / position data;
+- отримання відкритих ордерів;
+- створення ордерів;
+- скасування ордерів;
+- часткове та повне закриття позиції;
+- отримання fills / execution report;
+- отримання біржових обмежень інструмента:
+  - tick size;
+  - lot size;
+  - min qty;
+  - min notional;
+  - precision.
+
+---
+
+## 4. Режими роботи
+
+Усі терміни в проєкті мають бути уніфіковані. Дозволені лише такі назви режимів:
+
+### 4.1 `backtest`
+Історичне тестування на наборі свічок.
+
+Особливості:
+- використовується історичний OHLCV;
+- виконання моделюється локально;
+- ордери на біржу не надсилаються;
+- результати записуються в журнал;
+- використовується для звірки логіки з Pine Script.
+
+### 4.2 `dry_run`
+Робота на **реальному потоці ринкових даних**, але **без реального виставлення ордерів**.
+
+Особливості:
+- використовуються реальні котирування BingX;
+- сигнали рахуються в реальному часі;
+- ордери не відправляються на біржу;
+- ведеться локальна віртуальна позиція, лоти, PnL, журнали;
+- Telegram повідомляє про “віртуальні” відкриття/закриття;
+- режим обов’язковий перед переходом у live.
+
+### 4.3 `live`
+Реальна торгівля через BingX API.
+
+Особливості:
+- ринкові дані отримуються з біржі;
+- ордери відправляються на біржу;
+- локальний state синхронізується з BingX;
+- виконується перевірка fills;
+- при розсинхронізації застосовується політика safe-stop або manual confirm.
+
+### 4.4 Вимоги до однаковості логіки
+Логіка стратегії у режимах `dry_run` і `live` має бути однаковою. Відрізнятися може лише шар виконання ордерів.
+
+---
+
+## 5. Модель виконання стратегії
+
+### 5.1 Базова модель
+Стратегія працює **по закриттю бару**.
+
+**Execution model:**
+- `close-only execution`
+- базова модель виконання: `fill_price = close`
+
+### 5.2 Джерело тригера
+Умови тригерів можуть визначатися залежно від конфігурації:
+- по `high/low`;
+- або по `open/close body`.
+
+### 5.3 Формалізація `touch`
+Потрібно підтримати чіткий параметр конфігурації, який визначає, що вважати дотиком до рівня:
+- `TOUCH_MODE=wick` — дотик по high/low;
+- `TOUCH_MODE=body` — дотик по open/close body;
+- `TOUCH_MODE=close` — рівень вважається досягнутим лише на close.
+
+### 5.4 Пріоритети подій на одному барі
+Щоб уникнути неоднозначностей, події на одному барі обробляються в такому порядку:
+1. Перевірка критичних умов stop/safe-stop.
+2. Перевірка Full TP.
+3. Перевірка trailing TP exit.
+4. Перевірка sub-cover.
+5. Перевірка DCA.
+6. Логування та оновлення state.
+
+### 5.5 Правило конфлікту Full TP vs DCA
+Якщо на одному барі одночасно виконуються умови **Full TP** і **DCA**, пріоритет завжди має **Full TP**.
+
+### 5.6 Правило конфлікту Full TP vs sub-cover
+Якщо на одному барі одночасно виконуються умови **Full TP** і **sub-cover**, пріоритет має **Full TP**, якщо інше явно не визначено окремим параметром конфігурації.
+
+---
+
+## 6. Параметри стратегії
+
+### 6.1 Базовий ордер
+Потрібно підтримати два режими розрахунку стартового short-ордера:
+
+1. **Фіксований розмір у coin**
+   - `FIRST_SELL_QTY_COIN`
+
+2. **Відсоток від фіксованого equity у USDT**
+   - `USE_EQUITY_PCT_BASE=true`
+   - `BASE_ORDER_PCT_EQ`
+   - `EQUITY_FOR_SIZING_USDT`
+
+### 6.2 Full TP
+- `TP_PERCENT = 1.1`
+
+Розрахунок:
+```python
+full_tp_price = avg_price * (1 - TP_PERCENT / 100)
+```
+
+### 6.3 Trailing TP
+- `CALLBACK_PERCENT = 0.2`
+
+Алгоритм:
+1. ціна торкається Full TP;
+2. активується trailing;
+3. фіксується мінімум після активації;
+4. розраховується рівень виходу:
+
+```python
+trail_stop = trailing_min * (1 + CALLBACK_PERCENT / 100)
+```
+
+5. позиція закривається, якщо:
+```python
+close >= trail_stop
+```
+
+### 6.4 Sub-cover TP
+- `SUB_SELL_TP_PERCENT = 1.3`
+
+Розрахунок для останнього лота:
+```python
+last_lot_tp = last_lot.entry_price * (1 - SUB_SELL_TP_PERCENT / 100)
+```
+
+### 6.5 Максимум DCA
+- `MARGIN_CALL_LIMIT = 244`
+
+---
+
+## 7. DCA логіка
+
+### 7.1 Загальний принцип
+Стратегія відкриває нові short-ордери при рості ціни проти поточної позиції.
+
+### 7.2 Наступний рівень DCA
+```python
+next_level_price = last_fill_price * (1 + rise_percent / 100)
+```
+
+### 7.3 Нелінійні early-level кроки
+- `lvl2 = 0.3%`
+- `lvl3 = 0.4%`
+- `lvl4 = 0.6%`
+- `lvl5 = 0.8%`
+- `lvl6 = 0.8%`
+- `after = LINEAR_RISE_PERCENT`
+
+### 7.4 Множники DCA-ордерів
+- `lvl2 = 1.5x`
+- `lvl3 = 1.0x`
+- `lvl4 = 2.0x`
+- `lvl5 = 3.5x`
+- `after = 1.0x`
+
+### 7.5 Захист від DCA після TP touch
+Потрібно підтримати параметр:
+- `BLOCK_DCA_ON_TP_TOUCH=true/false`
+
+Логіка:
+- якщо `true`, то після дотику TP DCA до підтвердження TP не відкривається;
+- якщо `false`, поведінка визначається базовою логікою стратегії.
+
+---
+
+## 8. Структура позиції та лотів
+
+### 8.1 Модель лотів
+Кожен лот повинен зберігатися окремо.
+
+Структура лота:
+```python
+lot = {
+    "id": str,
+    "qty": float,
+    "entry_price": float,
+    "tag": str,
+    "usdt_value": float,
+    "created_at": str,
+    "source_order_id": str | None,
+}
+```
+
+### 8.2 Порядок обробки лотів
+Для sub-cover обов’язково використовується **LIFO**:
+- закривається останній відкритий лот.
+
+### 8.3 Потрібні колекції та поля
+- `lots[]`
+- `lot_ids[]`
+- `lot_qty[]`
+- `lot_price[]`
+- `lot_tags[]`
+- `lot_usdt[]`
+
+---
+
+## 9. Sub-cover логіка
+
+### 9.1 Умова активації
+Sub-cover може працювати лише після того, як:
+```python
+num_sells > 5
+```
+
+### 9.2 Що закривається
+Закривається **останній лот** за правилом LIFO.
+
+### 9.3 Режими підтвердження
+Потрібно підтримати параметр:
+- `SUBCOVER_CONFIRM_MODE=off`
+- `SUBCOVER_CONFIRM_MODE=breakeven`
+- `SUBCOVER_CONFIRM_MODE=subcover_tp`
+
+### 9.4 Базова логіка
+```python
+if low <= last_lot_tp:
+    close_last_lot()
+```
+
+### 9.5 Поведінка при конфлікті з Full TP
+Якщо на одному барі одночасно активуються `sub-cover` і `full_tp`, за замовчуванням виконується **Full TP**.
+
+---
+
+## 10. Перерахунок позиції
+
+Після кожного нового fill:
+
+```python
+pos_size_abs += qty
+pos_proceeds_usdt += qty * price
+avg_price = pos_proceeds_usdt / pos_size_abs
+```
+
+Після часткового закриття:
+- потрібно коректно перерахувати `pos_size_abs`;
+- зберегти історію часткових закриттів;
+- оновити LIFO-структуру лотів;
+- оновити `num_sells`, якщо це частина визначеної логіки циклу.
+
+---
+
+## 11. Full TP логіка
+
+### 11.1 Базова умова
+```python
+low <= full_tp_price
+```
+
+### 11.2 Підтвердження по close
+Потрібно підтримати параметр:
+- `REQUIRE_CLOSE_BELOW_FULL_TP=true/false`
+
+Якщо `true`, то додатково потрібно:
+```python
+close <= full_tp_price
+```
+
+### 11.3 Дія
+```python
+close_all_positions()
+reset_cycle()
+```
+
+---
+
+## 12. EVEN BAR FILTER
+
+### 12.1 Базове правило
+```python
+bars_from_anchor % 2 == 0
+```
+
+### 12.2 Формалізація anchor
+Потрібно чітко визначити точку відліку:
+- `EVEN_BAR_ANCHOR_MODE=utc_day_start` — від початку UTC-доби;
+- `EVEN_BAR_ANCHOR_MODE=live_start` — від моменту старту бота;
+- `EVEN_BAR_ANCHOR_MODE=fixed_timestamp` — від наперед заданого timestamp.
+
+### 12.3 Рекомендоване значення
+Для стабільної відтворюваності рекомендується:
+- `EVEN_BAR_ANCHOR_MODE=utc_day_start`
+
+### 12.4 Вимога
+Правило anchor повинно працювати однаково:
+- після рестарту;
+- у dry_run;
+- у live;
+- у backtest.
+
+---
+
+## 13. Обмеження частоти ордерів
+
+### 13.1 Rolling window
+- `MAX_ORDERS_PER_3MIN = 14`
+
+### 13.2 Ліміти на бар
+- `MAX_DCA_PER_BAR = 6`
+- `MAX_SUBCOVER_PER_BAR = 10`
+
+### 13.3 Вимога
+Ліміти мають перевірятися **до створення кожного ордера** у будь-якому режимі.
+
+---
+
+## 14. Live sync start
+
+### 14.1 Опція
+- `LIVE_START_TIME`
+
+### 14.2 Поведінка при старті live-режиму
+При старті live-режиму бот повинен:
+1. завантажити конфігурацію;
+2. виконати перевірку біржі;
+3. скинути або відновити стан відповідно до політики запуску;
+4. перейти в режим синхронізації;
+5. тільки після цього дозволити нові ордери.
+
+### 14.3 Політика запуску
+Потрібно підтримати параметр:
+- `LIVE_START_POLICY=reset`
+- `LIVE_START_POLICY=restore`
+- `LIVE_START_POLICY=sync_only`
+
+Рекомендовано для першої версії:
+- `reset` для чистого dry_run;
+- `restore` або `sync_only` для live після стабілізації.
+
+---
+
+## 15. Джерело істини та синхронізація state
+
+### 15.1 Проблема розсинхронізації
+Якщо локальний стан і стан на BingX розходяться, бот не повинен мовчки продовжувати торгівлю.
+
+### 15.2 Базове правило
+У live-режимі джерелом істини є комбінація:
+1. локального state storage;
+2. журналу подій та fills;
+3. поточного стану біржі.
+
+### 15.3 Політика при розсинхронізації
+Потрібно підтримати параметр:
+- `DESYNC_POLICY=safe_stop`
+- `DESYNC_POLICY=rebuild_from_exchange`
+- `DESYNC_POLICY=manual_confirm`
+
+### 15.4 Рекомендоване значення для першої версії
+- `DESYNC_POLICY=safe_stop`
+
+### 15.5 Safe-stop
+При розсинхронізації бот:
+- блокує нові ордери;
+- логгує помилку рівня CRITICAL;
+- надсилає Telegram alert;
+- очікує ручного підтвердження або окремої команди sync.
+
+---
+
+## 16. Відновлення після рестарту
+
+### 16.1 Вимога
+Бот повинен вміти відновити роботу після рестарту без втрати внутрішньої логіки.
+
+### 16.2 Що потрібно зберігати локально
+- всі відкриті лоти;
+- історію відкриття та часткових закриттів;
+- order_id / client_order_id;
+- avg price;
+- pos size;
+- proceeds;
+- num_sells;
+- last_fill_price;
+- next_level_price;
+- trailing state;
+- статистику обмежень по барах і rolling window;
+- поточний cycle id.
+
+### 16.3 Вимога до storage
+Біржа не є достатнім джерелом для відновлення LIFO-лотів. Тому бот зобов’язаний вести **власне локальне сховище state**.
+
+### 16.4 Формат storage
+Рекомендовано:
+- **SQLite** як основний варіант;
+- JSON — лише для простого debug або резервного snapshot.
+
+---
+
+## 17. Backfill історії на старті
+
+### 17.1 Вимога
+На старті бот має завантажувати історію свічок, достатню для коректного розрахунку логіки.
+
+### 17.2 Мінімум
+Потрібно підтримати параметр:
+- `STARTUP_CANDLES_BACKFILL`
+
+Рекомендоване значення для першої версії:
+- `STARTUP_CANDLES_BACKFILL=300`
+
+### 17.3 Для чого потрібен backfill
+- ініціалізація even-bar filter;
+- перевірка попередніх умов циклу;
+- коректне визначення першого робочого бару;
+- відтворення Pine-логіки після старту.
+
+---
+
+## 18. Правила округлення та біржові обмеження
+
+### 18.1 Вимога
+Усі ордери в `dry_run` і `live` мають проходити через однакову функцію нормалізації.
+
+### 18.2 Потрібно врахувати
+- tick size;
+- lot step;
+- min qty;
+- min notional;
+- precision.
+
+### 18.3 Обов’язкова функція
+```python
+def normalize_order(symbol: str, price: float | None, qty: float) -> NormalizedOrder:
+    ...
+```
+
+### 18.4 Поведінка при невідповідності
+Якщо ордер після нормалізації не проходить мінімальні вимоги біржі:
+- або коригується до допустимого значення;
+- або пропускається;
+- або переводить бот у safe-stop, якщо це критичний сценарій.
+
+Політика має задаватися параметром:
+- `INVALID_ORDER_POLICY=adjust`
+- `INVALID_ORDER_POLICY=skip`
+- `INVALID_ORDER_POLICY=safe_stop`
+
+---
+
+## 19. Політика помилок API
+
+### 19.1 Обов’язкові класи обробки
+Потрібно розділяти:
+- мережеві помилки;
+- timeout;
+- rate limit;
+- помилки валідації ордера;
+- невідомий статус ордера;
+- partial fill;
+- критичні помилки синхронізації.
+
+### 19.2 Retry policy
+Потрібно підтримати:
+- `API_MAX_RETRIES`
+- `API_BACKOFF_BASE_SECONDS`
+- `API_BACKOFF_MODE=exponential`
+
+Рекомендовані значення:
+- `API_MAX_RETRIES=3`
+- `API_BACKOFF_BASE_SECONDS=1`
+- `API_BACKOFF_MODE=exponential`
+
+### 19.3 Часткове виконання
+При `partial fill` бот зобов’язаний:
+- оновити локальний розмір позиції;
+- оновити лоти;
+- записати проміжний статус ордера;
+- не дублювати ордер повторно без перевірки біржі.
+
+### 19.4 Невідомий статус ордера
+Якщо відповідь API не підтверджує остаточний стан ордера:
+1. бот перевіряє статус ордера через окремий запит;
+2. звіряє fills;
+3. лише після цього приймає рішення про повтор.
+
+### 19.5 Safe-stop
+При критичних помилках синхронізації або сумнівному стані ордера бот переходить у safe-stop.
+
+---
+
+## 20. Стан бота
+
+### 20.1 Структура state
+```python
+state = {
+    "mode": str,
+    "symbol": str,
+    "timeframe": str,
+    "cycle_id": int,
+
+    "pos_size_abs": float,
+    "pos_proceeds_usdt": float,
+    "avg_price": float,
+
+    "num_sells": int,
+    "last_fill_price": float | None,
+    "next_level_price": float | None,
+
+    "lots": list,
+
+    "trailing_active": bool,
+    "trailing_min": float | None,
+
+    "cycle_base_qty": float,
+    "reset_cycle": bool,
+
+    "orders_last_3min": list,
+    "fills_this_bar": int,
+    "subcovers_this_bar": int,
+
+    "last_candle_time": str | None,
+    "last_sync_time": str | None,
+    "desync_detected": bool,
+}
+```
+
+---
+
+## 21. Основний цикл бота
+
+```python
+while True:
+    receive_market_update()
+    detect_new_candle()
+    update_runtime_state()
+
+    if new_bar_confirmed:
+        apply_even_bar_filter()
+        check_full_tp()
+        check_trailing_exit()
+        check_subcover()
+        check_dca()
+
+    validate_risk_limits()
+    execute_or_simulate_orders()
+    persist_state()
+    notify_telegram()
+    log_state()
+```
+
+---
+
+## 22. Основні модулі Python-проєкту
+
+### 22.1 `config.py`
+- завантаження `.env`;
+- валідація параметрів;
+- уніфікація режимів `backtest`, `dry_run`, `live`.
+
+### 22.2 `exchange/bingx_client.py`
+- обгортка над BingX REST / WS;
+- отримання OHLCV;
+- отримання позиції;
+- отримання fills;
+- створення/скасування ордерів;
+- отримання metadata інструмента.
+
+### 22.3 `engine/strategy_engine.py`
+- core-логіка стратегії;
+- TP / trailing / sub-cover / DCA;
+- пріоритети подій;
+- state machine.
+
+### 22.4 `engine/position_manager.py`
+- робота з позицією;
+- розрахунок avg price;
+- перерахунок proceeds;
+- підтримка лотів.
+
+### 22.5 `engine/risk_manager.py`
+- max orders per 3 min;
+- max fills per bar;
+- max subcovers per bar;
+- safe-stop;
+- перевірка дозволу на створення ордера.
+
+### 22.6 `execution/order_manager.py`
+- створення заявок;
+- partial/full close;
+- контроль статусів ордерів;
+- reconcile fills.
+
+### 22.7 `simulation/paper_engine.py`
+- симуляція виконання;
+- однакова логіка з live, але без біржі.
+
+### 22.8 `data/market_stream.py`
+- WebSocket підписка;
+- формування барів;
+- контроль reconnect.
+
+### 22.9 `storage/storage.py`
+- SQLite state storage;
+- збереження lot history;
+- збереження subscribers;
+- snapshot state;
+- restore state.
+
+### 22.10 `utils/logger.py`
+- структуровані логи;
+- audit trail;
+- окремі логи подій, ордерів, помилок.
+
+### 22.11 `telegram/telegram_notifier.py`
+- broadcast повідомлень;
+- реєстрація/видалення користувача;
+- throttling;
+- fail-safe при помилках Telegram.
+
+### 22.12 `telegram/telegram_bot.py`
+- `/start`
+- `/stop`
+- `/status`
+- `/position`
+- `/pnl`
+- `/sync` (рекомендовано)
+
+---
+
+## 23. Рекомендована структура проєкту
+
+```text
+bot/
+    main.py
+    config.py
+
+    exchange/
+        bingx_client.py
+
+    data/
+        market_stream.py
+
+    engine/
+        strategy_engine.py
+        position_manager.py
+        risk_manager.py
+
+    execution/
+        order_manager.py
+
+    simulation/
+        paper_engine.py
+        backtest_engine.py
+
+    storage/
+        storage.py
+        models.py
+
+    telegram/
+        telegram_notifier.py
+        telegram_bot.py
+
+    utils/
+        logger.py
+        time_utils.py
+        rounding.py
+        ids.py
+
+    tests/
+        test_strategy.py
+        test_position_manager.py
+        test_risk_manager.py
+        test_rounding.py
+        test_sync.py
+```
+
+---
+
+## 24. Telegram інтеграція
+
+### 24.1 Загальна вимога
+Усі торгові події мають:
+- записуватися у локальний журнал;
+- дублюватися в Telegram.
+
+### 24.2 Підписка користувачів
+Будь-який користувач може:
+1. знайти бота;
+2. натиснути `/start`;
+3. бути доданим до таблиці підписників.
+
+### 24.3 Таблиця підписників
+```text
+subscribers
+- id
+- chat_id
+- username
+- first_name
+- created_at
+- is_active
+```
+
+### 24.4 Джерело даних для команд
+Команди `/status`, `/position`, `/pnl` повинні використовувати:
+1. локальний runtime state;
+2. локальний storage;
+3. а не прямий виклик біржі на кожен запит.
+
+Біржа використовується для синхронізації, а не як джерело відповіді на кожну команду.
+
+### 24.5 Мінімальний набір команд
+- `/start` — підписка
+- `/stop` — відписка
+- `/status` — стан бота
+- `/position` — поточна локальна позиція
+- `/pnl` — поточний локальний PnL
+- `/sync` — ручна звірка з біржею
+
+### 24.6 Типи повідомлень
+- `BOT_STARTED`
+- `FIRST_SHORT`
+- `DCA_SHORT`
+- `SUB_COVER`
+- `FULL_COVER`
+- `TRAILING_TP`
+- `RESET_CYCLE`
+- `SAFE_STOP`
+- `ERROR`
+
+### 24.7 Структура повідомлення
+Кожне повідомлення повинно містити:
+- `timestamp`
+- `mode`
+- `symbol`
+- `event_type`
+- `price`
+- `qty`
+- `position_size`
+- `avg_price`
+- `pnl`
+- `reason`
+- `cycle_id`
+
+### 24.8 Throttling
+- `TELEGRAM_MAX_MESSAGES_PER_SECOND = 10`
+
+### 24.9 Fail-safe
+Telegram-модуль не повинен зупиняти бота при:
+- Telegram API error;
+- timeout;
+- network error.
+
+---
+
+## 25. Логування
+
+### 25.1 Обов’язкові події для логування
+- FIRST SHORT
+- DCA SHORT
+- SUB COVER
+- FULL COVER
+- TRAILING TP
+- RESET CYCLE
+- SAFE STOP
+- ERROR
+- RESTORE STATE
+- DESYNC DETECTED
+
+### 25.2 Вимога до логів
+Кожна подія в Telegram також повинна бути записана в лог.
+
+### 25.3 Логи мають бути придатні для audit trail
+Потрібно зберігати:
+- коли виник сигнал;
+- коли був створений ордер;
+- коли отримано fill;
+- як змінився state;
+- чому прийнято рішення;
+- який режим був активний.
+
+---
+
+## 26. Конфігурація `.env`
+
+Усі конфігурації повинні зберігатися в `.env`, а кожен параметр має бути документований коментарем.
+
+Приклад:
+
+```dotenv
+###########################################
+# BINGX API CONFIG
+###########################################
+
+# BingX API key
+BINGX_API_KEY=
+
+# BingX API secret
+BINGX_API_SECRET=
+
+# Use BingX testnet when supported
+BINGX_TESTNET=false
+
+###########################################
+# BOT MODE
+###########################################
+
+# Allowed values: backtest, dry_run, live
+MODE=dry_run
+
+###########################################
+# MARKET CONFIG
+###########################################
+
+# Trading symbol
+SYMBOL=BTC-USDT
+
+# Strategy timeframe
+TIMEFRAME=1m
+
+# Candles to preload on startup
+STARTUP_CANDLES_BACKFILL=300
+
+###########################################
+# STRATEGY PARAMETERS
+###########################################
+
+# Start order fixed coin size
+FIRST_SELL_QTY_COIN=0.09
+
+# Use percent of equity for base order sizing
+USE_EQUITY_PCT_BASE=false
+
+# Base order percent of equity
+BASE_ORDER_PCT_EQ=0
+
+# Fixed equity used for sizing
+EQUITY_FOR_SIZING_USDT=100
+
+# Full TP percent
+TP_PERCENT=1.1
+
+# Trailing callback percent
+CALLBACK_PERCENT=0.2
+
+# Sub-cover TP percent
+SUB_SELL_TP_PERCENT=1.3
+
+# Maximum DCA levels
+MARGIN_CALL_LIMIT=244
+
+# Block DCA after TP touch until confirmation
+BLOCK_DCA_ON_TP_TOUCH=true
+
+# Require close below full TP level
+REQUIRE_CLOSE_BELOW_FULL_TP=true
+
+# Touch mode: wick, body, close
+TOUCH_MODE=wick
+
+# Sub-cover confirm mode: off, breakeven, subcover_tp
+SUBCOVER_CONFIRM_MODE=subcover_tp
+
+###########################################
+# EVEN BAR FILTER
+###########################################
+
+# Enable even-bar filter
+ENABLE_EVEN_BAR_FILTER=true
+
+# Anchor mode: utc_day_start, live_start, fixed_timestamp
+EVEN_BAR_ANCHOR_MODE=utc_day_start
+
+# Optional fixed anchor timestamp in ISO format
+EVEN_BAR_FIXED_TIMESTAMP=
+
+###########################################
+# RISK LIMITS
+###########################################
+
+# Maximum orders per rolling 3-minute window
+MAX_ORDERS_PER_3MIN=14
+
+# Maximum DCA fills per bar
+MAX_DCA_PER_BAR=6
+
+# Maximum sub-covers per bar
+MAX_SUBCOVER_PER_BAR=10
+
+###########################################
+# SYNC / RECOVERY
+###########################################
+
+# Live start policy: reset, restore, sync_only
+LIVE_START_POLICY=reset
+
+# Policy on state desynchronization: safe_stop, rebuild_from_exchange, manual_confirm
+DESYNC_POLICY=safe_stop
+
+# Invalid order policy: adjust, skip, safe_stop
+INVALID_ORDER_POLICY=adjust
+
+###########################################
+# API ERROR HANDLING
+###########################################
+
+# Maximum API retries
+API_MAX_RETRIES=3
+
+# Base backoff in seconds
+API_BACKOFF_BASE_SECONDS=1
+
+# Backoff mode: exponential
+API_BACKOFF_MODE=exponential
+
+###########################################
+# TELEGRAM CONFIG
+###########################################
+
+# Telegram bot token
+TELEGRAM_BOT_TOKEN=
+
+# Enable Telegram notifications
+TELEGRAM_ENABLED=true
+
+# SQLite database file
+SQLITE_DB_PATH=bot_state.db
+
+# Telegram throttling
+TELEGRAM_MAX_MESSAGES_PER_SECOND=10
+
+###########################################
+# LOGGING
+###########################################
+
+# Log level
+LOG_LEVEL=INFO
+
+# Log file path
+LOG_FILE=bot.log
+```
+
+---
+
+## 27. Нефункціональні вимоги
+
+Обов’язково:
+- async architecture;
+- WebSocket price feed;
+- persistent state storage;
+- error recovery;
+- retry API;
+- захист від дублювання ордерів;
+- повний audit trail;
+- просте перемикання між `backtest`, `dry_run`, `live`;
+- відсутність хардкоду секретів;
+- однакова логіка нормалізації ордерів для `dry_run` і `live`.
+
+---
+
+## 28. Критерії приймання
+
+Рішення вважається прийнятним, якщо:
+
+1. Бот відтворює логіку Pine Script без втрати ключових правил стратегії.
+2. Є три робочі режими: `backtest`, `dry_run`, `live`.
+3. `dry_run` працює на реальному ринку без відправлення реальних ордерів.
+4. `live` виконує реальні ордери через BingX API.
+5. Підтримується LIFO-логіка лотів.
+6. Підтримується відновлення state після рестарту.
+7. Є чітка політика safe-stop при розсинхронізації або критичних помилках.
+8. Є коректна нормалізація цін і кількостей під правила BingX.
+9. Кожен ордер і кожна подія логуються локально.
+10. Кожен ордер і ключові події дублюються в Telegram.
+11. Команди Telegram працюють із локального state/storage.
+12. Усі параметри задокументовані в `.env`.
+
+---
+
+## 29. Рекомендований порядок реалізації
+
+1. Конфігурація та валідація `.env`
+2. Локальне storage і state model
+3. BingX client + market data stream
+4. Нормалізація ордерів і біржові обмеження
+5. Strategy engine
+6. Dry-run execution layer
+7. Telegram notifier + commands
+8. Live execution layer
+9. Reconcile / sync / restart recovery
+10. Backtest engine
+11. Тести на edge cases
+
+---
+
+## 30. Ключові edge cases, які потрібно покрити тестами
+
+Обов’язково протестувати:
+- одночасний Full TP і DCA на одному барі;
+- одночасний Full TP і sub-cover на одному барі;
+- TP touch без close-confirmation;
+- частковий fill;
+- розсинхронізацію локального state і біржі;
+- рестарт бота при наявній позиції;
+- even-bar filter після рестарту;
+- ордер нижче min notional;
+- Telegram error без падіння бота;
+- перевищення ліміту ордерів за 3 хвилини.
+
+---
+
+## 31. Підсумок
+
+Це ТЗ є основним документом для реалізації Python-бота. У випадку конфлікту між старими нотатками, чернетками або допоміжними файлами пріоритет має саме це технічне завдання.
