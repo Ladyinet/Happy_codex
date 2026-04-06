@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from bot.config import TouchMode
-from bot.storage.models import BotState, EventRecord, OrderIntent
+from bot.config import Settings
+from bot.storage.models import BotState, EventRecord, InstrumentConstraints, OrderIntent
 
 
 @dataclass(slots=True)
@@ -29,8 +29,9 @@ class StrategyContext:
 
     candle: Candle
     state: BotState
-    touch_mode: TouchMode
+    settings: Settings
     even_bar_allowed: bool
+    constraints: InstrumentConstraints | None = None
 
 
 @dataclass(slots=True)
@@ -39,4 +40,12 @@ class StrategyDecision:
 
     order_intents: list[OrderIntent] = field(default_factory=list)
     events: list[EventRecord] = field(default_factory=list)
+    updated_state: BotState | None = None
+    full_tp_triggered: bool = False
+    trailing_exit_triggered: bool = False
+    subcover_triggered: bool = False
+    dca_triggered: bool = False
+    blocked_by_even_bar: bool = False
+    blocked_by_tp_touch: bool = False
+    safe_stop_required: bool = False
     safe_stop_reason: str | None = None
