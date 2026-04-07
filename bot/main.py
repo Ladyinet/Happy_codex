@@ -8,10 +8,12 @@ from typing import Protocol
 
 from bot.config import BotMode, LiveStartPolicy, Settings, load_settings
 from bot.data.candle_clock import CandleClock
+from bot.data.market_source import BingXMarketSource
 from bot.data.market_stream import CandleUpdateBuffer
 from bot.engine.position_manager import PositionManager
 from bot.engine.risk_manager import RiskManager
 from bot.engine.strategy_engine import StrategyEngine
+from bot.exchange.bingx_client import BingXClient
 from bot.execution.dry_run_executor import DryRunExecutor
 from bot.execution.order_manager import OrderManager
 from bot.runner.orchestrator import DryRunOrchestrator
@@ -29,6 +31,20 @@ class BootstrapStorageProtocol(Protocol):
         """Load a previously stored runtime state."""
 
 
+class BootstrapMarketSourceProtocol(Protocol):
+    """Minimal read-only market-source API required for dry_run bootstrap."""
+
+    async def fetch_instrument_constraints(self, symbol: str) -> InstrumentConstraints:
+        """Return instrument constraints for the startup symbol."""
+
+    async def fetch_startup_candles(self, symbol: str, timeframe: str, limit: int):
+        """Return startup candles in the internal candle format."""
+
+
+class BootstrapError(RuntimeError):
+    """Raised when the dry_run bootstrap cannot fetch required read-only market data."""
+
+
 @dataclass(slots=True)
 class DryRunStack:
     """All local components required to run one dry_run pipeline."""
@@ -42,7 +58,7 @@ class DryRunStack:
     strategy_engine: StrategyEngine
     executor: DryRunExecutor
     orchestrator: DryRunOrchestrator
-
+    startup_candles_loaded: int = 0
 
 def build_initial_state(*, settings: Settings) -> BotState:
     """Return a clean runtime state for dry_run startup."""
@@ -78,20 +94,6 @@ async def restore_or_initialize_state(
         return build_initial_state(settings=settings)
 
     raise ValueError("Only reset and restore policies are supported for local dry_run bootstrap in v1.")
-
-
-def build_default_constraints(*, settings: Settings) -> InstrumentConstraints:
-    """Return local placeholder constraints for dry_run bootstrap."""
-
-    return InstrumentConstraints(
-        symbol=settings.symbol,
-        tick_size=0.1,
-        lot_step=0.001,
-        min_qty=0.01,
-        min_notional=10.0,
-        price_precision=1,
-        qty_precision=3,
-    )
 
 
 def create_orchestrator(
@@ -133,8 +135,9 @@ async def build_dry_run_stack(
     *,
     settings: Settings | None = None,
     storage: BootstrapStorageProtocol | None = None,
+    market_source: BootstrapMarketSourceProtocol | None = None,
 ) -> DryRunStack:
-    """Build a complete local dry_run stack without network calls."""
+    """Build a complete dry_run stack with read-only startup market data."""
 
     resolved_settings = settings or load_settings()
     if resolved_settings.mode != BotMode.DRY_RUN:
@@ -148,23 +151,28 @@ async def build_dry_run_stack(
 
     await resolved_storage.init_db()
     runtime_state = await restore_or_initialize_state(settings=resolved_settings, storage=resolved_storage)
-    constraints = build_default_constraints(settings=resolved_settings)
+    constraints, startup_candles = await fetch_startup_market_snapshot(
+        settings=resolved_settings,
+        market_source=market_source,
+    )
     orchestrator = create_orchestrator(
         settings=resolved_settings,
         storage=resolved_storage,
         runtime_state=runtime_state,
         constraints=constraints,
     )
+    startup_candles_loaded = await orchestrator.warmup_from_candles(startup_candles)
     return DryRunStack(
         settings=resolved_settings,
         storage=resolved_storage,
-        runtime_state=runtime_state,
+        runtime_state=orchestrator.runtime_state,
         constraints=constraints,
         buffer=orchestrator.candle_buffer,
         clock=orchestrator.candle_clock,
         strategy_engine=orchestrator.strategy_engine,
         executor=orchestrator.executor,
         orchestrator=orchestrator,
+        startup_candles_loaded=startup_candles_loaded,
     )
 
 
@@ -179,11 +187,53 @@ def main() -> None:
 
     stack = asyncio.run(run_local_bootstrap())
     print(
-        "dry_run bootstrap ready",
-        stack.settings.symbol,
-        stack.settings.timeframe,
-        stack.runtime_state.pos_size_abs,
+        f"mode={stack.settings.mode.value}",
+        f"symbol={stack.settings.symbol}",
+        f"timeframe={stack.settings.timeframe}",
+        f"startup_candles_loaded={stack.startup_candles_loaded}",
+        f"last_candle_time={stack.runtime_state.last_candle_time.isoformat() if stack.runtime_state.last_candle_time else 'none'}",
     )
+
+
+async def fetch_startup_market_snapshot(
+    *,
+    settings: Settings,
+    market_source: BootstrapMarketSourceProtocol | None = None,
+) -> tuple[InstrumentConstraints, list]:
+    """Fetch real startup constraints and historical candles for dry_run bootstrap."""
+
+    if market_source is not None:
+        return await _fetch_from_market_source(settings=settings, market_source=market_source)
+
+    async with BingXClient(testnet=settings.bingx_testnet) as client:
+        return await _fetch_from_market_source(
+            settings=settings,
+            market_source=BingXMarketSource(client),
+        )
+
+
+async def _fetch_from_market_source(
+    *,
+    settings: Settings,
+    market_source: BootstrapMarketSourceProtocol,
+) -> tuple[InstrumentConstraints, list]:
+    try:
+        constraints = await market_source.fetch_instrument_constraints(settings.symbol)
+    except Exception as exc:
+        raise BootstrapError(f"Failed to fetch instrument constraints for {settings.symbol}: {exc}") from exc
+
+    try:
+        startup_candles = await market_source.fetch_startup_candles(
+            settings.symbol,
+            settings.timeframe,
+            settings.startup_candles_backfill,
+        )
+    except Exception as exc:
+        raise BootstrapError(
+            f"Failed to fetch startup candles for {settings.symbol} {settings.timeframe}: {exc}"
+        ) from exc
+
+    return constraints, startup_candles
 
 
 if __name__ == "__main__":
