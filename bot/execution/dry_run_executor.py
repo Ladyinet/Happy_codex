@@ -54,11 +54,26 @@ class DryRunExecutor(BaseExecutor):
 
         normalized = self.order_normalizer.normalize_order(
             symbol=intent.symbol,
-            price=intent.price if intent.price is not None else candle.close,
+            price=(
+                None
+                if intent.intent_type
+                in {OrderIntentType.FULL_COVER, OrderIntentType.SUB_COVER, OrderIntentType.TRAILING_TP}
+                else intent.price if intent.price is not None else candle.close
+            ),
             qty=intent.qty,
             constraints=constraints,
         )
         normalized_check = self.risk_manager.check_normalized_order(normalized)
+        if (
+            not normalized_check.allow
+            and self._can_execute_local_open_below_min_notional(
+                intent=intent,
+                normalized_reason=normalized.reason,
+                normalized_qty=normalized.qty,
+                constraints=constraints,
+            )
+        ):
+            normalized_check = type(normalized_check)(allow=True)
         if not normalized_check.allow:
             return ExecutionResult(
                 updated_state=state,
@@ -146,6 +161,25 @@ class DryRunExecutor(BaseExecutor):
             safe_stop_required=False,
             reason=None,
         )
+
+    @staticmethod
+    def _can_execute_local_open_below_min_notional(
+        *,
+        intent: OrderIntent,
+        normalized_reason: str | None,
+        normalized_qty: float,
+        constraints: InstrumentConstraints,
+    ) -> bool:
+        """Allow only dry-run virtual open intents that miss min_notional after safe downward rounding.
+
+        This keeps min_qty protection intact and avoids affecting close intents or any future live path.
+        """
+
+        if intent.intent_type not in {OrderIntentType.FIRST_SHORT, OrderIntentType.DCA_SHORT}:
+            return False
+        if normalized_qty < constraints.min_qty:
+            return False
+        return normalized_reason is not None and "min_notional" in normalized_reason
 
     def _apply_fill_to_state(
         self,

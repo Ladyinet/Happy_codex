@@ -134,7 +134,7 @@ class DryRunOrchestrator:
             return result
 
         seen_intent_keys: set[str] = set()
-        working_state = decision.updated_state or self.runtime_state
+        working_state = self.runtime_state
         for intent in decision.order_intents:
             execution_result = await self.executor.execute_intent(
                 intent=intent,

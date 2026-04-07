@@ -111,7 +111,7 @@ class PositionManager:
         else:
             for lot in updated.lots:
                 if lot.id == last_lot.id:
-                    lot.qty = last_lot.qty - close_qty
+                    lot.qty = round(last_lot.qty - close_qty, 12)
                     lot.usdt_value = lot.qty * lot.entry_price
                     break
 
