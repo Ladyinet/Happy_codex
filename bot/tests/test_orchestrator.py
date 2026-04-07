@@ -211,3 +211,65 @@ async def test_duplicate_or_old_candle_update_does_not_repeat_execution() -> Non
     assert len(storage.orders) == order_count
     assert duplicate_result.closed_bar_processed is False
     assert old_result.closed_bar_processed is False
+
+
+@pytest.mark.asyncio
+async def test_warmup_does_not_create_retroactive_execution() -> None:
+    storage = InMemoryStorage()
+    orchestrator = _orchestrator(storage=storage)
+
+    loaded = await orchestrator.warmup_from_candles(
+        [
+            _candle(0, 1, 100.0),
+            _candle(1, 2, 101.0),
+            _candle(2, 3, 102.0),
+        ]
+    )
+
+    assert loaded == 3
+    assert storage.orders == []
+    assert storage.fills == []
+    assert storage.events == []
+    assert orchestrator.runtime_state.last_candle_time == datetime(2026, 4, 10, 12, 3, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_already_known_candle_after_warmup_does_not_run_execution() -> None:
+    storage = InMemoryStorage()
+    orchestrator = _orchestrator(storage=storage)
+
+    await orchestrator.warmup_from_candles(
+        [
+            _candle(0, 1, 100.0),
+            _candle(1, 2, 101.0),
+        ]
+    )
+    result = await orchestrator.process_candle_update(_candle(1, 2, 101.5))
+
+    assert result.closed_bar_processed is False
+    assert storage.orders == []
+    assert storage.fills == []
+
+
+@pytest.mark.asyncio
+async def test_next_new_bar_after_warmup_runs_one_execution_path() -> None:
+    storage = InMemoryStorage()
+    clock = CandleClock(
+        timeframe="1m",
+        anchor_mode=EvenBarAnchorMode.FIXED_TIMESTAMP,
+        fixed_timestamp=datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc),
+    )
+    orchestrator = _orchestrator(storage=storage, clock=clock)
+
+    await orchestrator.warmup_from_candles(
+        [
+            _candle(0, 1, 100.0),
+            _candle(1, 2, 101.0),
+        ]
+    )
+    result = await orchestrator.process_candle_update(_candle(2, 3, 102.0))
+
+    assert result.closed_bar_processed is True
+    assert len(result.execution_results) == 1
+    assert len(storage.orders) == 1
+    assert len(storage.fills) == 1
