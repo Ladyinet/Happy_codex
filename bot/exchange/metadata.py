@@ -38,19 +38,43 @@ def metadata_to_instrument_constraints(metadata: dict[str, Any] | BingXInstrumen
 def extract_tick_size(raw: dict[str, Any]) -> float:
     """Extract price tick size from one BingX symbol payload."""
 
-    return _require_float(raw, direct_keys=("tickSize", "priceTick"), filter_type="PRICE_FILTER", filter_keys=("tickSize",))
+    explicit_tick_size = _optional_float(
+        raw,
+        direct_keys=("tickSize", "priceTick"),
+        filter_type="PRICE_FILTER",
+        filter_keys=("tickSize",),
+    )
+    if explicit_tick_size is not None:
+        return explicit_tick_size
+
+    price_precision = _optional_int(raw, direct_keys=("pricePrecision",))
+    if price_precision is None:
+        raise BingXMetadataError(
+            "Missing required metadata field: tickSize, priceTick, PRICE_FILTER.tickSize or pricePrecision"
+        )
+    return 10 ** (-price_precision)
 
 
 def extract_lot_step(raw: dict[str, Any]) -> float:
     """Extract quantity step size from one BingX symbol payload."""
 
-    return _require_float(raw, direct_keys=("stepSize", "lotStep", "quantityStep"), filter_type="LOT_SIZE", filter_keys=("stepSize",))
+    return _require_float(
+        raw,
+        direct_keys=("stepSize", "lotStep", "quantityStep", "size"),
+        filter_type="LOT_SIZE",
+        filter_keys=("stepSize",),
+    )
 
 
 def extract_min_qty(raw: dict[str, Any]) -> float:
     """Extract minimum order quantity from one BingX symbol payload."""
 
-    return _require_float(raw, direct_keys=("minQty", "quantityMin"), filter_type="LOT_SIZE", filter_keys=("minQty",))
+    return _require_float(
+        raw,
+        direct_keys=("minQty", "quantityMin", "tradeMinQuantity"),
+        filter_type="LOT_SIZE",
+        filter_keys=("minQty",),
+    )
 
 
 def extract_min_notional(raw: dict[str, Any]) -> float:
@@ -58,7 +82,7 @@ def extract_min_notional(raw: dict[str, Any]) -> float:
 
     return _require_float(
         raw,
-        direct_keys=("minNotional", "notional", "minOrderValue"),
+        direct_keys=("minNotional", "notional", "minOrderValue", "tradeMinUSDT"),
         filter_type="MIN_NOTIONAL",
         filter_keys=("minNotional", "notional"),
     )
@@ -67,13 +91,39 @@ def extract_min_notional(raw: dict[str, Any]) -> float:
 def extract_price_precision(raw: dict[str, Any]) -> int:
     """Extract price precision from one BingX symbol payload."""
 
-    return _require_int(raw, direct_keys=("pricePrecision",), fallback_value=extract_tick_size(raw))
+    precision = _optional_int(raw, direct_keys=("pricePrecision",))
+    if precision is not None:
+        return precision
+
+    explicit_tick_size = _optional_float(
+        raw,
+        direct_keys=("tickSize", "priceTick"),
+        filter_type="PRICE_FILTER",
+        filter_keys=("tickSize",),
+    )
+    if explicit_tick_size is not None:
+        return _precision_from_step(explicit_tick_size)
+
+    raise BingXMetadataError("Missing required metadata field: pricePrecision")
 
 
 def extract_qty_precision(raw: dict[str, Any]) -> int:
     """Extract quantity precision from one BingX symbol payload."""
 
-    return _require_int(raw, direct_keys=("quantityPrecision", "qtyPrecision"), fallback_value=extract_lot_step(raw))
+    precision = _optional_int(raw, direct_keys=("quantityPrecision", "qtyPrecision"))
+    if precision is not None:
+        return precision
+
+    lot_step = _optional_float(
+        raw,
+        direct_keys=("stepSize", "lotStep", "quantityStep", "size"),
+        filter_type="LOT_SIZE",
+        filter_keys=("stepSize",),
+    )
+    if lot_step is not None:
+        return _precision_from_step(lot_step)
+
+    raise BingXMetadataError("Missing required metadata field: quantityPrecision or qtyPrecision")
 
 
 def _require_float(
@@ -83,6 +133,21 @@ def _require_float(
     filter_type: str,
     filter_keys: tuple[str, ...],
 ) -> float:
+    value = _optional_float(raw, direct_keys=direct_keys, filter_type=filter_type, filter_keys=filter_keys)
+    if value is not None:
+        return value
+
+    key_list = ", ".join((*direct_keys, *(f"{filter_type}.{key}" for key in filter_keys)))
+    raise BingXMetadataError(f"Missing required metadata field: {key_list}")
+
+
+def _optional_float(
+    raw: dict[str, Any],
+    *,
+    direct_keys: tuple[str, ...],
+    filter_type: str,
+    filter_keys: tuple[str, ...],
+) -> float | None:
     for key in direct_keys:
         if key in raw and raw[key] is not None:
             return _to_float(raw[key], field_name=key)
@@ -92,21 +157,18 @@ def _require_float(
         for key in filter_keys:
             if key in filter_payload and filter_payload[key] is not None:
                 return _to_float(filter_payload[key], field_name=f"{filter_type}.{key}")
-
-    key_list = ", ".join((*direct_keys, *(f"{filter_type}.{key}" for key in filter_keys)))
-    raise BingXMetadataError(f"Missing required metadata field: {key_list}")
+    return None
 
 
-def _require_int(
+def _optional_int(
     raw: dict[str, Any],
     *,
     direct_keys: tuple[str, ...],
-    fallback_value: float,
-) -> int:
+) -> int | None:
     for key in direct_keys:
         if key in raw and raw[key] is not None:
             return _to_int(raw[key], field_name=key)
-    return _precision_from_step(fallback_value)
+    return None
 
 
 def _find_filter(raw: dict[str, Any], filter_type: str) -> dict[str, Any] | None:
