@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from inspect import isawaitable
+from typing import Awaitable, Callable
 
 from bot.storage.models import BotState
 from bot.telegram.telegram_notifier import TelegramNotifier
@@ -16,7 +17,7 @@ class TelegramBotController:
         self,
         *,
         notifier: TelegramNotifier,
-        state_getter: Callable[[], BotState],
+        state_getter: Callable[[], BotState | Awaitable[BotState]],
     ) -> None:
         self.notifier = notifier
         self.state_getter = state_getter
@@ -40,7 +41,7 @@ class TelegramBotController:
         """Return local dry_run status without querying the exchange."""
 
         _ = chat_id
-        state = self.state_getter()
+        state = await self._get_state()
         lines = [
             f"mode: {state.mode.value}",
             f"symbol: {state.symbol}",
@@ -56,7 +57,7 @@ class TelegramBotController:
         """Return local position summary without exchange access."""
 
         _ = chat_id
-        state = self.state_getter()
+        state = await self._get_state()
         return "\n".join(
             [
                 f"pos_size_abs: {state.pos_size_abs}",
@@ -70,7 +71,7 @@ class TelegramBotController:
         """Return a limited local dry_run PnL summary."""
 
         _ = chat_id
-        state = self.state_getter()
+        state = await self._get_state()
         return "\n".join(
             [
                 "PnL summary not fully implemented yet in dry_run v1.",
@@ -85,3 +86,11 @@ class TelegramBotController:
 
         _ = chat_id
         return "sync not implemented in dry_run v1"
+
+    async def _get_state(self) -> BotState:
+        """Resolve local runtime state from either a sync or async provider."""
+
+        state = self.state_getter()
+        if isawaitable(state):
+            return await state
+        return state
