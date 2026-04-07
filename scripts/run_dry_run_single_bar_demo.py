@@ -36,31 +36,68 @@ async def _run() -> int:
     print(f"last_candle_time: {datetime_to_iso(stack.runtime_state.last_candle_time) if stack.runtime_state.last_candle_time else 'n/a'}")
     print(f"current_pos_size_abs_before_new_bar: {pos_before}")
 
-    next_candle = _build_synthetic_next_candle(current_candle, timeframe=stack.settings.timeframe)
-    result = await stack.orchestrator.process_candle_update(next_candle)
+    first_next_candle = _build_synthetic_next_candle(current_candle, timeframe=stack.settings.timeframe)
+    first_result = await stack.orchestrator.process_candle_update(first_next_candle)
+    _print_step_result(step=1, result=first_result, pos_before=pos_before)
 
+    second_input_base = stack.buffer.current_candle or first_next_candle
+    pos_before_second = stack.orchestrator.runtime_state.pos_size_abs
+    second_next_candle = _build_synthetic_next_candle(second_input_base, timeframe=stack.settings.timeframe)
+    second_result = await stack.orchestrator.process_candle_update(second_next_candle)
+    _print_step_result(step=2, result=second_result, pos_before=pos_before_second)
+
+    return 0
+
+
+def _print_step_result(*, step: int, result, pos_before: float) -> None:
+    processed_bar = result.market_update.closed_candle
+    processed_bar_time = (
+        datetime_to_iso(processed_bar.close_time)
+        if processed_bar is not None
+        else "n/a"
+    )
     orders_count = sum(1 for item in result.execution_results if item.order is not None)
     fills_count = sum(len(item.fills) for item in result.execution_results)
-    execution_events_count = sum(len(item.events) for item in result.execution_results)
     strategy_events_count = len(result.strategy_decision.events) if result.strategy_decision is not None else 0
-    pos_after = result.runtime_state.pos_size_abs if result.runtime_state is not None else stack.runtime_state.pos_size_abs
+    pos_after = result.runtime_state.pos_size_abs if result.runtime_state is not None else pos_before
     last_candle_after = (
         datetime_to_iso(result.runtime_state.last_candle_time)
         if result.runtime_state is not None and result.runtime_state.last_candle_time is not None
         else "n/a"
     )
+    reason = _derive_no_execution_reason(result)
 
-    print(f"processed_closed_bar: {result.closed_bar_processed}")
-    print(f"execution_results_count: {len(result.execution_results)}")
-    print(f"orders_count: {orders_count}")
-    print(f"fills_count: {fills_count}")
-    print(f"execution_events_count: {execution_events_count}")
-    print(f"strategy_events_count: {strategy_events_count}")
-    print(f"pos_size_abs_before: {pos_before}")
-    print(f"pos_size_abs_after: {pos_after}")
-    print(f"last_candle_time_after: {last_candle_after}")
+    print(f"step_{step}_close_time_processed_bar: {processed_bar_time}")
+    print(f"step_{step}_even_bar_allowed: {result.even_bar_allowed}")
+    print(f"step_{step}_processed_closed_bar: {result.closed_bar_processed}")
+    print(f"step_{step}_execution_results_count: {len(result.execution_results)}")
+    print(f"step_{step}_orders_count: {orders_count}")
+    print(f"step_{step}_fills_count: {fills_count}")
+    print(f"step_{step}_strategy_events_count: {strategy_events_count}")
+    print(f"step_{step}_pos_size_abs_before: {pos_before}")
+    print(f"step_{step}_pos_size_abs_after: {pos_after}")
+    print(f"step_{step}_last_candle_time_after: {last_candle_after}")
+    if reason is not None:
+        print(f"step_{step}_reason: {reason}")
 
-    return 0
+
+def _derive_no_execution_reason(result) -> str | None:
+    if not result.closed_bar_processed:
+        return "no newly closed bar was emitted by the buffer"
+    if result.execution_results:
+        return None
+    decision = result.strategy_decision
+    if decision is None:
+        return "strategy decision is not available"
+    if decision.safe_stop_required:
+        return f"safe_stop_required: {decision.safe_stop_reason or 'no reason provided'}"
+    if decision.blocked_by_even_bar:
+        return "bar blocked by even-bar filter"
+    if decision.blocked_by_tp_touch:
+        return "DCA blocked by TP touch rule"
+    if not decision.order_intents:
+        return "strategy produced no order intents on this bar"
+    return "no execution results were produced"
 
 
 def _build_synthetic_next_candle(current_candle: Candle, *, timeframe: str) -> Candle:
