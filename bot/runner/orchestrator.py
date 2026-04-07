@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -74,6 +75,26 @@ class DryRunOrchestrator:
         self.executor = executor
         self.constraints = constraints
         self._last_processed_close_time = runtime_state.last_candle_time
+
+    async def warmup_from_candles(self, candles: list[StreamCandle], *, persist_state: bool = True) -> int:
+        """Preload historical candles into the buffer without retroactive strategy execution."""
+
+        if not candles:
+            return 0
+
+        ordered = sorted(candles, key=lambda candle: candle.close_time)
+        for candle in ordered:
+            self.candle_buffer.process_update(candle)
+
+        updated_state = deepcopy(self.runtime_state)
+        updated_state.last_candle_time = ordered[-1].close_time
+        self.runtime_state = updated_state
+        self._last_processed_close_time = self.candle_buffer.last_emitted_close_time
+
+        if persist_state:
+            await self.storage.save_bot_state(self.runtime_state)
+
+        return len(ordered)
 
     async def process_candle_update(self, candle_update: StreamCandle) -> OrchestratorStepResult:
         """Process one candle update through the local dry_run pipeline."""
