@@ -155,6 +155,19 @@ async def build_telegram_service(
     )
 
 
+def validate_telegram_runtime(
+    *,
+    settings: Settings,
+    app_runtime_mode: str = APP_RUNTIME_TELEGRAM_ONLY,
+) -> None:
+    """Validate Telegram-specific runtime requirements for launcher-level modes."""
+
+    if not settings.telegram_enabled:
+        raise AppLaunchError(f"APP_RUNTIME_MODE={app_runtime_mode} requires TELEGRAM_ENABLED=true.")
+    if not settings.telegram_bot_token:
+        raise AppLaunchError("TELEGRAM_BOT_TOKEN is required when Telegram runtime is enabled.")
+
+
 async def build_app_context(
     *,
     settings: Settings | None = None,
@@ -214,15 +227,20 @@ async def run_dry_run_only(**kwargs) -> AppContext:
     return await build_app_context(app_runtime_mode=APP_RUNTIME_DRY_RUN_ONLY, **kwargs)
 
 
+async def build_telegram_polling_context(**kwargs) -> AppContext:
+    """Build the Telegram-only runtime context without starting polling immediately."""
+
+    return await build_app_context(app_runtime_mode=APP_RUNTIME_TELEGRAM_ONLY, **kwargs)
+
+
 async def run_telegram_only(**kwargs) -> AppContext:
     """Build Telegram-only runtime and start polling if enabled."""
 
-    context = await build_app_context(app_runtime_mode=APP_RUNTIME_TELEGRAM_ONLY, **kwargs)
+    context = await build_telegram_polling_context(**kwargs)
     telegram_service = context.telegram_service
     if telegram_service is None:
         raise AppLaunchError("Telegram service was not built for telegram_only mode.")
-    if not telegram_service.enabled:
-        raise AppLaunchError("APP_RUNTIME_MODE=telegram_only requires TELEGRAM_ENABLED=true.")
+    validate_telegram_runtime(settings=context.settings, app_runtime_mode=APP_RUNTIME_TELEGRAM_ONLY)
     if telegram_service.polling_runner is None:
         raise AppLaunchError("Telegram polling runner is not configured.")
     await telegram_service.polling_runner()
@@ -236,8 +254,7 @@ async def run_dry_run_with_telegram(**kwargs) -> AppContext:
     telegram_service = context.telegram_service
     if telegram_service is None:
         raise AppLaunchError("Telegram service was not built for dry_run_with_telegram mode.")
-    if not telegram_service.enabled:
-        raise AppLaunchError("APP_RUNTIME_MODE=dry_run_with_telegram requires TELEGRAM_ENABLED=true.")
+    validate_telegram_runtime(settings=context.settings, app_runtime_mode=APP_RUNTIME_DRY_RUN_WITH_TELEGRAM)
     if telegram_service.polling_runner is None:
         raise AppLaunchError("Telegram polling runner is not configured.")
     await telegram_service.polling_runner()
