@@ -51,14 +51,29 @@ def _metadata_payload() -> dict:
         "code": 0,
         "data": [
             {
-                "symbol": "BTC-USDT",
+                "apiStateClose": "true",
+                "apiStateOpen": "true",
+                "asset": "BTC",
+                "brokerState": False,
+                "contractId": "100",
+                "currency": "USDT",
+                "displayName": "BTC-USDT",
+                "ensureTrigger": True,
+                "feeRate": 0.0005,
+                "launchTime": 1586275200000,
+                "maintainTime": 0,
+                "makerFeeRate": 0.0002,
+                "offTime": 0,
                 "pricePrecision": 1,
-                "quantityPrecision": 3,
-                "filters": [
-                    {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
-                    {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.01"},
-                    {"filterType": "MIN_NOTIONAL", "notional": "10"},
-                ],
+                "quantityPrecision": 4,
+                "size": "0.0001",
+                "status": 1,
+                "symbol": "BTC-USDT",
+                "takerFeeRate": 0.0005,
+                "tradeMinLimit": 0,
+                "tradeMinQuantity": 0.0001,
+                "tradeMinUSDT": 2,
+                "triggerFeeRate": "0.00050000",
             }
         ],
     }
@@ -79,11 +94,31 @@ def test_metadata_is_converted_to_instrument_constraints() -> None:
 
     assert constraints.symbol == "BTC-USDT"
     assert constraints.tick_size == 0.1
+    assert constraints.lot_step == 0.0001
+    assert constraints.min_qty == 0.0001
+    assert constraints.min_notional == 2.0
+    assert constraints.price_precision == 1
+    assert constraints.qty_precision == 4
+
+
+def test_legacy_metadata_format_is_still_supported() -> None:
+    constraints = metadata_to_instrument_constraints(
+        {
+            "symbol": "BTC-USDT",
+            "pricePrecision": 1,
+            "quantityPrecision": 3,
+            "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+                {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.01"},
+                {"filterType": "MIN_NOTIONAL", "notional": "10"},
+            ],
+        }
+    )
+
+    assert constraints.tick_size == 0.1
     assert constraints.lot_step == 0.001
     assert constraints.min_qty == 0.01
     assert constraints.min_notional == 10.0
-    assert constraints.price_precision == 1
-    assert constraints.qty_precision == 3
 
 
 def test_invalid_metadata_payload_raises_clear_error() -> None:
