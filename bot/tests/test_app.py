@@ -95,12 +95,17 @@ class FakeController:
     state_provider: object
 
 
-def _settings(*, telegram_enabled: bool = True, token: str | None = "token") -> Settings:
+def _settings(
+    *,
+    telegram_enabled: bool = True,
+    token: str | None = "token",
+    live_start_policy: LiveStartPolicy = LiveStartPolicy.RESET,
+) -> Settings:
     return Settings(
         mode=BotMode.DRY_RUN,
         symbol="BTC-USDT",
         timeframe="1m",
-        live_start_policy=LiveStartPolicy.RESET,
+        live_start_policy=live_start_policy,
         startup_candles_backfill=2,
         even_bar_anchor_mode=EvenBarAnchorMode.FIXED_TIMESTAMP,
         even_bar_fixed_timestamp="2026-04-12T12:01:00+00:00",
@@ -295,7 +300,7 @@ async def test_app_launcher_does_not_change_trading_state_directly() -> None:
     before = storage.restored_state.pos_size_abs if storage.restored_state is not None else 0.0
 
     context = await build_app_context(
-        settings=_settings(),
+        settings=_settings(live_start_policy=LiveStartPolicy.RESTORE),
         app_runtime_mode=APP_RUNTIME_DRY_RUN_WITH_TELEGRAM,
         storage=storage,
         market_source=market_source,
