@@ -14,7 +14,7 @@ from bot.engine.signals import StrategyContext, StrategyDecision
 from bot.engine.strategy_engine import StrategyEngine
 from bot.execution.base_executor import ExecutionResult
 from bot.execution.dry_run_executor import DryRunExecutor
-from bot.storage.models import BotState, InstrumentConstraints, SafeStopRecord
+from bot.storage.models import BotState, EventRecord, InstrumentConstraints, SafeStopRecord
 from bot.utils.ids import new_id
 
 
@@ -35,6 +35,13 @@ class StorageProtocol(Protocol):
 
     async def save_safe_stop_reason(self, record: SafeStopRecord) -> None:
         """Persist one safe-stop record."""
+
+
+class NotifierProtocol(Protocol):
+    """Minimal notifier API used by the orchestrator."""
+
+    async def broadcast_event(self, event: EventRecord) -> int:
+        """Broadcast one structured event safely."""
 
 
 @dataclass(slots=True)
@@ -64,6 +71,7 @@ class DryRunOrchestrator:
         strategy_engine: StrategyEngine,
         executor: DryRunExecutor,
         constraints: InstrumentConstraints,
+        notifier: NotifierProtocol | None = None,
     ) -> None:
         self.symbol = symbol
         self.timeframe = timeframe
@@ -74,6 +82,7 @@ class DryRunOrchestrator:
         self.strategy_engine = strategy_engine
         self.executor = executor
         self.constraints = constraints
+        self.notifier = notifier
         self._last_processed_close_time = runtime_state.last_candle_time
 
     async def warmup_from_candles(self, candles: list[StreamCandle], *, persist_state: bool = True) -> int:
@@ -130,6 +139,7 @@ class DryRunOrchestrator:
                 await self.storage.save_bot_state(self.runtime_state)
             for event in decision.events:
                 await self.storage.save_event(event)
+                await self._notify_event(event)
             await self.storage.save_safe_stop_reason(
                 SafeStopRecord(
                     safe_stop_id=new_id("safe_stop"),
@@ -150,6 +160,7 @@ class DryRunOrchestrator:
                 await self.storage.save_bot_state(self.runtime_state)
             for event in decision.events:
                 await self.storage.save_event(event)
+                await self._notify_event(event)
             self._last_processed_close_time = closed_bar.close_time
             result.runtime_state = self.runtime_state
             return result
@@ -176,6 +187,7 @@ class DryRunOrchestrator:
                 await self.storage.save_fill(fill)
             for event in execution_result.events:
                 await self.storage.save_event(event)
+                await self._notify_event(event)
             if execution_result.safe_stop_required:
                 await self.storage.save_safe_stop_reason(
                     SafeStopRecord(
@@ -192,6 +204,16 @@ class DryRunOrchestrator:
         self._last_processed_close_time = closed_bar.close_time
         result.runtime_state = self.runtime_state
         return result
+
+    async def _notify_event(self, event: EventRecord) -> None:
+        """Send one event to the optional notifier without breaking the pipeline."""
+
+        if self.notifier is None:
+            return
+        try:
+            await self.notifier.broadcast_event(event)
+        except Exception:
+            return
 
     @staticmethod
     def _to_strategy_candle(candle: StreamCandle) -> StrategyCandle:
