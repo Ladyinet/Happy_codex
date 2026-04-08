@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -220,6 +221,36 @@ async def test_parse_ws_message_parses_candle_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_parse_ws_message_supports_gzip_bytes_payload() -> None:
+    raw_payload = gzip.compress(
+        json.dumps(
+            _candle_payload(
+                open_ms=_minute_ms(1),
+                close_ms=_minute_ms(2),
+                close=68459.1,
+            )
+        ).encode("utf-8")
+    )
+
+    parsed = parse_ws_message(raw_payload)
+
+    assert parsed.candle is not None
+    assert parsed.candle.close == 68459.1
+    assert parsed.candle.close_time == datetime(2026, 4, 10, 12, 2, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_parse_ws_message_supports_gzip_ping_and_returns_pong() -> None:
+    raw_payload = gzip.compress(json.dumps({"ping": "12345", "time": "2026-04-08T10:00:00Z"}).encode("utf-8"))
+
+    parsed = parse_ws_message(raw_payload)
+
+    assert parsed.candle is None
+    assert parsed.ignored is True
+    assert parsed.reply_message == {"pong": "12345", "time": "2026-04-08T10:00:00Z"}
+
+
+@pytest.mark.asyncio
 async def test_invalid_payload_is_skipped_by_stream_loop() -> None:
     websocket = FakeWebSocket(
         [
@@ -243,6 +274,37 @@ async def test_invalid_payload_is_skipped_by_stream_loop() -> None:
 
     assert len(candles) == 1
     assert candles[0].close == 68459.1
+    assert any("skipping invalid payload" in status for status in statuses)
+
+
+@pytest.mark.asyncio
+async def test_invalid_gzip_payload_is_skipped_by_stream_loop() -> None:
+    websocket = FakeWebSocket(
+        [
+            b"not-a-valid-gzip-payload",
+            gzip.compress(
+                json.dumps(_candle_payload(open_ms=_minute_ms(2), close_ms=_minute_ms(3), close=68460.1)).encode(
+                    "utf-8"
+                )
+            ),
+        ]
+    )
+    connector = FakeConnector([websocket])
+    statuses: list[str] = []
+    market_ws = BingXMarketWebSocket(connector=connector, sleep=_sleep_stub)
+
+    candles = [
+        candle
+        async for candle in market_ws.stream_candles(
+            symbol="BTC-USDT",
+            timeframe="1m",
+            status_callback=statuses.append,
+            max_candles=1,
+        )
+    ]
+
+    assert len(candles) == 1
+    assert candles[0].close == 68460.1
     assert any("skipping invalid payload" in status for status in statuses)
 
 

@@ -89,7 +89,7 @@ def parse_ws_message(raw_message: str | bytes) -> ParsedWSMessage:
     """Parse one raw websocket message into the internal candle model.
 
     Supported v1 payload shapes:
-    - ``{"ping": ...}`` -> produces a pong reply
+    - ``{"ping": "...", "time": "..."}`` -> produces a pong reply in the same format
     - ack/status messages -> safely ignored
     - kline payloads with ``dataType="BTC-USDT@kline_1min"`` and either:
       - ``data`` as a candle dict
@@ -100,10 +100,13 @@ def parse_ws_message(raw_message: str | bytes) -> ParsedWSMessage:
     payload = _decode_json_payload(raw_message)
 
     if "ping" in payload:
+        reply_message = {"pong": payload["ping"]}
+        if "time" in payload:
+            reply_message["time"] = payload["time"]
         return ParsedWSMessage(
             ignored=True,
             reason="ping",
-            reply_message={"pong": payload["ping"]},
+            reply_message=reply_message,
         )
 
     if _is_ack_or_status_message(payload):
@@ -214,11 +217,6 @@ def _decode_json_payload(raw_message: str | bytes) -> dict[str, Any]:
 
 
 def _decode_bytes_payload(raw_message: bytes) -> str:
-    try:
-        return raw_message.decode("utf-8")
-    except UnicodeDecodeError:
-        pass
-
     decompressors = (
         lambda value: gzip.decompress(value),
         lambda value: zlib.decompress(value, zlib.MAX_WBITS | 16),
@@ -229,6 +227,12 @@ def _decode_bytes_payload(raw_message: bytes) -> str:
             return decompressor(raw_message).decode("utf-8")
         except Exception:
             continue
+
+    try:
+        return raw_message.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
     raise MarketWSPayloadError("Unable to decode websocket binary payload.")
 
 
