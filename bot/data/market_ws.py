@@ -148,6 +148,8 @@ class BingXMarketWebSocket:
         status_callback: StatusCallback | None = None,
         reconnect_attempts: int | None = None,
         max_candles: int | None = None,
+        debug: bool = False,
+        debug_message_limit: int = 10,
     ):
         """Yield normalized public candle updates with simple reconnect support."""
 
@@ -162,8 +164,14 @@ class BingXMarketWebSocket:
                     await _emit_status(status_callback, "connected")
                     subscribe_message = build_kline_subscribe_message(symbol, timeframe)
                     await websocket.send(json.dumps(subscribe_message))
+                    if debug:
+                        await _emit_status(status_callback, f"subscribe sent: {json.dumps(subscribe_message)}")
+                    debug_messages_seen = 0
 
                     async for raw_message in websocket:
+                        if debug and debug_messages_seen < debug_message_limit:
+                            debug_messages_seen += 1
+                            await _emit_status(status_callback, _format_debug_message(raw_message, debug_messages_seen))
                         try:
                             parsed = parse_ws_message(raw_message)
                         except MarketWSPayloadError as exc:
@@ -244,6 +252,36 @@ def _is_ack_or_status_message(payload: dict[str, Any]) -> bool:
     if payload.get("reqType") in {"sub", "unsub"}:
         return True
     return False
+
+
+def _format_debug_message(raw_message: str | bytes, sequence: int) -> str:
+    """Return a short human-readable debug summary for one raw websocket message."""
+
+    try:
+        payload = _decode_json_payload(raw_message)
+    except MarketWSPayloadError as exc:
+        return f"ws_debug[{sequence}] invalid payload: {exc}"
+
+    keys = sorted(str(key) for key in payload.keys())
+    data_type = payload.get("dataType")
+
+    if _is_subscribe_ack(payload):
+        return (
+            f"ws_debug[{sequence}] ack "
+            f"id={payload.get('id')} code={payload.get('code')} msg={payload.get('msg', '')!r}"
+        )
+
+    if "ping" in payload:
+        return f"ws_debug[{sequence}] ping ping={payload.get('ping')!r} time={payload.get('time')!r}"
+
+    if isinstance(data_type, str) and "@kline_" in data_type:
+        return f"ws_debug[{sequence}] candle_update dataType={data_type}"
+
+    return f"ws_debug[{sequence}] unknown keys={keys} dataType={data_type!r}"
+
+
+def _is_subscribe_ack(payload: dict[str, Any]) -> bool:
+    return "id" in payload and payload.get("code") in (0, "0")
 
 
 def _extract_timeframe_from_channel(channel: str) -> str:

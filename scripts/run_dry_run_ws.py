@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 from bot.config import load_settings
-from bot.data.market_ws import BingXMarketWebSocket, MarketWSError
+from bot.data.market_ws import BingXMarketWebSocket, MarketWSError, build_kline_subscribe_message
 from bot.main import build_dry_run_stack
 from bot.utils.time_utils import datetime_to_iso
 
@@ -30,6 +30,10 @@ async def _run() -> int:
         "last_candle_time: "
         f"{datetime_to_iso(stack.runtime_state.last_candle_time) if stack.runtime_state.last_candle_time else 'n/a'}"
     )
+    debug = True
+    subscribe_payload = build_kline_subscribe_message(settings.symbol, settings.timeframe)
+    print(f"debug_mode: {debug}")
+    print(f"subscribe_payload: {subscribe_payload}")
 
     market_ws = BingXMarketWebSocket(testnet=settings.bingx_testnet)
 
@@ -41,6 +45,7 @@ async def _run() -> int:
             symbol=settings.symbol,
             timeframe=settings.timeframe,
             status_callback=_status_logger,
+            debug=debug,
         ):
             print(
                 "candle_update_received: "
