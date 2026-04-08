@@ -1,0 +1,17 @@
+Після запуску перевір у Telegram:
+
+/start
+/status
+/position
+/pnl
+/sync
+/stop
+
+Що я очікую:
+
+/start підпише тебе;
+/status покаже mode, symbol, timeframe, last_candle_time, safe_stop;
+/position покаже локальний стан позиції;
+/pnl дасть хоча б обмежений dry-run summary;
+/sync відповість заглушкою;
+/stop деактивує підписку.
