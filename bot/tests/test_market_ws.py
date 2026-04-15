@@ -309,6 +309,28 @@ async def test_invalid_gzip_payload_is_skipped_by_stream_loop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_candles_yields_internal_candle() -> None:
+    websocket = FakeWebSocket(
+        [json.dumps(_candle_payload(open_ms=_minute_ms(2), close_ms=_minute_ms(3), close=68460.1))]
+    )
+    connector = FakeConnector([websocket])
+    market_ws = BingXMarketWebSocket(connector=connector, sleep=_sleep_stub)
+
+    candles = [
+        candle
+        async for candle in market_ws.stream_candles(
+            symbol="BTC-USDT",
+            timeframe="1m",
+            max_candles=1,
+        )
+    ]
+
+    assert len(candles) == 1
+    assert candles[0].close == 68460.1
+    assert candles[0].close_time == datetime(2026, 4, 10, 12, 3, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
 async def test_reconnect_path_exists() -> None:
     second_socket = FakeWebSocket(
         [json.dumps(_candle_payload(open_ms=_minute_ms(2), close_ms=_minute_ms(3), close=68460.1))]
@@ -350,7 +372,7 @@ async def test_mocked_ws_update_can_be_forwarded_to_orchestrator() -> None:
     await orchestrator.warmup_from_candles([_candle(0, 1, 100.0), _candle(1, 2, 101.0)])
     parsed = parse_ws_message(json.dumps(_candle_payload(open_ms=_minute_ms(2), close_ms=_minute_ms(3), close=102.0)))
 
-    result = await orchestrator.process_candle_update(parsed.candle)
+    result = await orchestrator.process_market_update(parsed.candle)
 
     assert result.closed_bar_processed is True
     assert len(result.execution_results) == 1
@@ -365,11 +387,11 @@ async def test_duplicate_or_old_ws_update_does_not_repeat_execution() -> None:
 
     await orchestrator.warmup_from_candles([_candle(0, 1, 100.0), _candle(1, 2, 101.0)])
     parsed = parse_ws_message(json.dumps(_candle_payload(open_ms=_minute_ms(2), close_ms=_minute_ms(3), close=102.0)))
-    await orchestrator.process_candle_update(parsed.candle)
+    await orchestrator.process_market_update(parsed.candle)
     initial_orders = len(storage.orders)
 
-    duplicate_result = await orchestrator.process_candle_update(parsed.candle)
-    old_result = await orchestrator.process_candle_update(_candle(1, 2, 101.0))
+    duplicate_result = await orchestrator.process_market_update(parsed.candle)
+    old_result = await orchestrator.process_market_update(_candle(1, 2, 101.0))
 
     assert len(storage.orders) == initial_orders
     assert duplicate_result.closed_bar_processed is False
