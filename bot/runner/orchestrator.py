@@ -205,6 +205,11 @@ class DryRunOrchestrator:
         result.runtime_state = self.runtime_state
         return result
 
+    async def process_market_update(self, candle_update: StreamCandle) -> OrchestratorStepResult:
+        """Thin alias used by live/ws runners for one incoming market candle update."""
+
+        return await self.process_candle_update(candle_update)
+
     async def _notify_event(self, event: EventRecord) -> None:
         """Send one event to the optional notifier without breaking the pipeline."""
 
