@@ -50,12 +50,17 @@ async def _run() -> int:
             status_callback=_status_logger,
             debug=debug,
         ):
+            current_buffer_close_time_before = (
+                stack.buffer.current_candle.close_time
+                if stack.buffer.current_candle is not None
+                else None
+            )
             pos_before = stack.orchestrator.runtime_state.pos_size_abs
             update_kind = _classify_update(
                 current_buffer_candle=stack.buffer.current_candle,
                 incoming_candle=candle,
             )
-            step_result = await stack.orchestrator.process_candle_update(candle)
+            step_result = await stack.orchestrator.process_market_update(candle)
             orders_count = sum(1 for item in step_result.execution_results if item.order is not None)
             fills_count = sum(len(item.fills) for item in step_result.execution_results)
             pos_after = (
@@ -64,7 +69,18 @@ async def _run() -> int:
                 else pos_before
             )
             close_time_changed = last_logged_close_time != candle.close_time
-            should_log = close_time_changed or step_result.closed_bar_processed or logged_updates < max_verbose_updates
+            safe_stop = (
+                step_result.strategy_decision.safe_stop_required
+                if step_result.strategy_decision is not None
+                else any(item.safe_stop_required for item in step_result.execution_results)
+            )
+            should_log = (
+                close_time_changed
+                or step_result.closed_bar_processed
+                or len(step_result.execution_results) > 0
+                or safe_stop
+                or logged_updates < max_verbose_updates
+            )
             if not should_log:
                 continue
 
@@ -77,10 +93,15 @@ async def _run() -> int:
             )
             reason = _derive_no_execution_reason(step_result)
             print(
-                "candle_update: "
+                "runner_received_candle: "
                 f"candle_close_time={datetime_to_iso(candle.close_time)} "
                 f"candle_close_price={candle.close} "
                 f"update_kind={update_kind}"
+            )
+            print(
+                "buffer_state: "
+                f"current_buffer_close_time_before="
+                f"{datetime_to_iso(current_buffer_close_time_before) if current_buffer_close_time_before else 'n/a'}"
             )
             print(
                 "pipeline_step: "
@@ -130,6 +151,12 @@ def _derive_no_execution_reason(step_result) -> str | None:
     if not step_result.closed_bar_processed:
         if step_result.market_update.ignored_update:
             return f"market update ignored: {step_result.market_update.reason or 'unknown'}"
+        current_candle = step_result.market_update.current_candle
+        if current_candle is not None:
+            return (
+                "current candle update only; waiting for a newer close_time to close the previous bar "
+                f"(buffer_current_close_time={datetime_to_iso(current_candle.close_time)})"
+            )
         return "buffer did not emit a newly closed bar"
 
     decision = step_result.strategy_decision
