@@ -251,6 +251,32 @@ async def test_parse_ws_message_supports_gzip_ping_and_returns_pong() -> None:
 
 
 @pytest.mark.asyncio
+async def test_parse_ws_message_supports_nested_dict_shape() -> None:
+    payload = {
+        "dataType": "BTC-USDT@kline_1min",
+        "data": {
+            "result": {
+                "item": {
+                    "t": str(_minute_ms(2)),
+                    "T": str(_minute_ms(3)),
+                    "o": "100.1",
+                    "h": "101.1",
+                    "l": "99.1",
+                    "c": "100.9",
+                    "v": "12.0",
+                }
+            }
+        },
+    }
+
+    parsed = parse_ws_message(json.dumps(payload))
+
+    assert parsed.candle is not None
+    assert parsed.candle.close == 100.9
+    assert parsed.candle.close_time == datetime(2026, 4, 10, 12, 3, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
 async def test_invalid_payload_is_skipped_by_stream_loop() -> None:
     websocket = FakeWebSocket(
         [
@@ -328,6 +354,33 @@ async def test_stream_candles_yields_internal_candle() -> None:
     assert len(candles) == 1
     assert candles[0].close == 68460.1
     assert candles[0].close_time == datetime(2026, 4, 10, 12, 3, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_candle_like_unsupported_shape_is_skipped_with_clear_reason() -> None:
+    websocket = FakeWebSocket(
+        [
+            json.dumps({"dataType": "BTC-USDT@kline_1min", "data": {"unexpected": {"foo": "bar"}}}),
+            json.dumps(_candle_payload(open_ms=_minute_ms(2), close_ms=_minute_ms(3), close=68460.1)),
+        ]
+    )
+    connector = FakeConnector([websocket])
+    statuses: list[str] = []
+    market_ws = BingXMarketWebSocket(connector=connector, sleep=_sleep_stub)
+
+    candles = [
+        candle
+        async for candle in market_ws.stream_candles(
+            symbol="BTC-USDT",
+            timeframe="1m",
+            status_callback=statuses.append,
+            max_candles=1,
+        )
+    ]
+
+    assert len(candles) == 1
+    assert any("candle_parse_failed:" in status for status in statuses)
+    assert any("top_level_keys=" in status for status in statuses)
 
 
 @pytest.mark.asyncio
