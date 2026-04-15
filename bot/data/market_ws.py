@@ -44,6 +44,7 @@ class ParsedWSMessage:
     """Structured result of parsing one websocket message."""
 
     candle: Candle | None = None
+    message_type: str = "unknown"
     ignored: bool = False
     reason: str | None = None
     reply_message: dict[str, Any] | None = None
@@ -104,23 +105,27 @@ def parse_ws_message(raw_message: str | bytes) -> ParsedWSMessage:
         if "time" in payload:
             reply_message["time"] = payload["time"]
         return ParsedWSMessage(
+            message_type="ping",
             ignored=True,
             reason="ping",
             reply_message=reply_message,
         )
 
     if _is_ack_or_status_message(payload):
-        return ParsedWSMessage(ignored=True, reason="ack_or_status")
+        return ParsedWSMessage(message_type="ack", ignored=True, reason="ack_or_status")
 
     channel = payload.get("dataType")
     if not isinstance(channel, str):
         raise MarketWSPayloadError("Websocket payload is missing string field 'dataType'.")
     if "@kline_" not in channel:
-        return ParsedWSMessage(ignored=True, reason="unsupported_channel")
+        return ParsedWSMessage(message_type="unknown", ignored=True, reason="unsupported_channel")
 
     timeframe = _extract_timeframe_from_channel(channel)
-    candle = _parse_candle_payload(payload.get("data"), timeframe=timeframe)
-    return ParsedWSMessage(candle=candle)
+    try:
+        candle = _parse_candle_payload(payload.get("data"), timeframe=timeframe)
+    except MarketWSPayloadError as exc:
+        raise MarketWSPayloadError(_build_candle_debug_error(payload, original_error=exc)) from exc
+    return ParsedWSMessage(message_type="candle_update", candle=candle)
 
 
 class BingXMarketWebSocket:
@@ -175,14 +180,35 @@ class BingXMarketWebSocket:
                         try:
                             parsed = parse_ws_message(raw_message)
                         except MarketWSPayloadError as exc:
-                            await _emit_status(status_callback, f"skipping invalid payload: {exc}")
+                            await _emit_status(status_callback, f"candle_parse_failed: {exc}")
                             continue
+
+                        if debug:
+                            await _emit_status(
+                                status_callback,
+                                "parse_result: "
+                                f"parsed_message_type={parsed.message_type} "
+                                f"ignored={parsed.ignored} "
+                                f"has_candle={parsed.candle is not None} "
+                                f"reply_message_present={parsed.reply_message is not None}",
+                            )
 
                         if parsed.reply_message is not None:
                             await websocket.send(json.dumps(parsed.reply_message))
                         if parsed.candle is None:
+                            if debug:
+                                await _emit_status(
+                                    status_callback,
+                                    f"{parsed.reason or 'candle_none_after_parse'}",
+                                )
                             continue
 
+                        await _emit_status(
+                            status_callback,
+                            "yield_candle "
+                            f"close_time={parsed.candle.close_time.isoformat()} "
+                            f"close_price={parsed.candle.close}",
+                        )
                         yield parsed.candle
                         delivered += 1
                         if max_candles is not None and delivered >= max_candles:
@@ -304,21 +330,80 @@ def websocket_interval_from_timeframe(timeframe: str) -> str:
 
 
 def _parse_candle_payload(data: Any, *, timeframe: str) -> Candle:
-    candidate = data
-    if isinstance(candidate, dict) and isinstance(candidate.get("K"), dict):
-        candidate = candidate["K"]
-    elif isinstance(candidate, dict) and isinstance(candidate.get("k"), dict):
-        candidate = candidate["k"]
-    elif isinstance(candidate, list):
-        if not candidate:
-            raise MarketWSPayloadError("Kline payload list must not be empty.")
-        candidate = candidate[-1]
+    candidate = _extract_candle_candidate(data)
 
     if isinstance(candidate, dict):
         return _parse_candle_dict(candidate, timeframe=timeframe)
     if isinstance(candidate, list):
         return _parse_candle_list(candidate, timeframe=timeframe)
     raise MarketWSPayloadError("Unsupported websocket candle payload structure.")
+
+
+def _extract_candle_candidate(data: Any) -> Any:
+    """Extract the most likely candle payload from supported nested websocket shapes."""
+
+    if isinstance(data, dict):
+        if isinstance(data.get("K"), dict):
+            return data["K"]
+        if isinstance(data.get("k"), dict):
+            return data["k"]
+        if _looks_like_candle_dict(data):
+            return data
+        for key in ("data", "item", "items", "result", "candle", "candles"):
+            nested = data.get(key)
+            if nested is None:
+                continue
+            candidate = _extract_candle_candidate(nested)
+            if candidate is not None:
+                return candidate
+        return data
+
+    if isinstance(data, list):
+        if not data:
+            raise MarketWSPayloadError("Kline payload list must not be empty.")
+        for item in data:
+            candidate = _extract_candle_candidate(item)
+            if candidate is not None:
+                return candidate
+        return data[0]
+
+    return data
+
+
+def _looks_like_candle_dict(data: dict[str, Any]) -> bool:
+    return any(key in data for key in ("t", "T", "o", "h", "l", "c", "v", "openTime", "closeTime", "open", "close"))
+
+
+def _build_candle_debug_error(payload: dict[str, Any], *, original_error: Exception) -> str:
+    data = payload.get("data")
+    data_k = data.get("K") if isinstance(data, dict) else None
+    data_k_lower = data.get("k") if isinstance(data, dict) else None
+    candidate = _extract_candle_candidate(data)
+    fields = _extract_candle_fields(candidate)
+    return (
+        f"{original_error}; "
+        f"top_level_keys={sorted(str(key) for key in payload.keys())}; "
+        f"dataType={payload.get('dataType')!r}; "
+        f"data_type={type(data).__name__}; "
+        f"keys(data)={sorted(data.keys()) if isinstance(data, dict) else 'n/a'}; "
+        f"keys(data.K)={sorted(data_k.keys()) if isinstance(data_k, dict) else 'n/a'}; "
+        f"keys(data.k)={sorted(data_k_lower.keys()) if isinstance(data_k_lower, dict) else 'n/a'}; "
+        f"candle_fields={fields}"
+    )
+
+
+def _extract_candle_fields(candidate: Any) -> dict[str, Any]:
+    if not isinstance(candidate, dict):
+        return {"candidate_type": type(candidate).__name__}
+    return {
+        "t": candidate.get("t", candidate.get("time", candidate.get("openTime"))),
+        "T": candidate.get("T", candidate.get("closeTime")),
+        "o": candidate.get("o", candidate.get("open")),
+        "h": candidate.get("h", candidate.get("high")),
+        "l": candidate.get("l", candidate.get("low")),
+        "c": candidate.get("c", candidate.get("close")),
+        "v": candidate.get("v", candidate.get("volume")),
+    }
 
 
 def _parse_candle_dict(payload: dict[str, Any], *, timeframe: str) -> Candle:
