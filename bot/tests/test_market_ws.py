@@ -300,7 +300,7 @@ async def test_invalid_payload_is_skipped_by_stream_loop() -> None:
 
     assert len(candles) == 1
     assert candles[0].close == 68459.1
-    assert any("skipping invalid payload" in status for status in statuses)
+    assert any("candle_parse_failed:" in status for status in statuses)
 
 
 @pytest.mark.asyncio
@@ -331,7 +331,7 @@ async def test_invalid_gzip_payload_is_skipped_by_stream_loop() -> None:
 
     assert len(candles) == 1
     assert candles[0].close == 68460.1
-    assert any("skipping invalid payload" in status for status in statuses)
+    assert any("candle_parse_failed:" in status for status in statuses)
 
 
 @pytest.mark.asyncio
