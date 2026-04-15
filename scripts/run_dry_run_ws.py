@@ -50,6 +50,11 @@ async def _run() -> int:
             status_callback=_status_logger,
             debug=debug,
         ):
+            print(
+                "runner_received_candle "
+                f"close_time={datetime_to_iso(candle.close_time)} "
+                f"close_price={candle.close}"
+            )
             current_buffer_close_time_before = (
                 stack.buffer.current_candle.close_time
                 if stack.buffer.current_candle is not None
